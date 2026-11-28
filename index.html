@@ -143,8 +143,8 @@
             <div class="label py-1"><span class="label-text text-xs">Container / Codec</span></div>
             <select id="exportFormat" class="select select-bordered select-sm w-full">
               <option value="auto" selected>Auto (WebM VP9 + Alpha)</option>
-              <option value="video/webm;codecs=vp9">WebM · VP9 (alpha)</option>
-              <option value="video/webm;codecs=vp8">WebM · VP8 (alpha)</option>
+              <option value="video/webm;codecs=vp9,opus">WebM · VP9 (alpha)</option>
+              <option value="video/webm;codecs=vp8,opus">WebM · VP8 (alpha)</option>
               <option value="video/mp4">MP4 (if supported)</option>
             </select>
           </label>
@@ -362,9 +362,9 @@
 </footer>
 
 <!-- ══════════════════════════ HIDDEN MEDIA ══════════════════════════ -->
-<video id="videoEl" playsinline loop style="display:none"></video>
-<img id="imgEl" style="display:none" alt="" />
-<audio id="audioEl" style="display:none"></audio>
+<video id="videoEl" playsinline loop crossorigin="anonymous" style="display:none"></video>
+<img id="imgEl" crossorigin="anonymous" style="display:none" alt="" />
+<audio id="audioEl" crossorigin="anonymous" style="display:none"></audio>
 
 <div id="toasts"></div>
 
@@ -779,12 +779,14 @@
       imglyWorkingPath = null;
       imglyFrameBusy = false;
       imglyLastFrameTime = 0;
+      imglyWorkQueue = null;
+      imglyLatestFrameBlob = null;
       setModelStatus('imgly', 'idle', 0, 'Not loaded');
       if (state.engine === 'imgly') {
         if (state.sourceType === 'image') {
           try { await runImglyOnImage(); } catch (e) { console.error(e); }
         } else if (state.sourceType === 'video') {
-          processImglyFrame();
+          scheduleImglyVideoFrame(true);
         }
       }
     }
@@ -997,17 +999,24 @@
   }
 
   /* ════════════════════════════════════════════════════════════
-     6. @imgly / ISNet — supports images AND video frames
+     6. @imgly / ISNet — LAG-FREE ASYNC WORKER + DECODED CACHE
      ════════════════════════════════════════════════════════════ */
 
   let imglyLoading = null;
   let imglySDKCache = null;
   let imglyWorkingPath = null;
 
-  /* Video-frame throttling */
+  /* Non-blocking single-slot frame queue so rAF / frameLoop never stalls */
   let imglyFrameBusy = false;
   let imglyLastFrameTime = 0;
-  const IMGLY_VIDEO_THROTTLE_MS = 800;
+  let imglyWorkQueue = null;
+  let imglyLatestFrameBlob = null;
+  let imglyCutoutUrl = null;
+  const IMGLY_VIDEO_THROTTLE_MS = 1100;
+  const IMGLY_MAX_INFER_DIM = 512;
+
+  const imglyInferCanvas = document.createElement('canvas');
+  const imglyInferCtx = imglyInferCanvas.getContext('2d', { willReadFrequently: false });
 
   const IMGLY_SDK_URLS = [
     'https://cdn.jsdelivr.net/npm/@imgly/background-removal@1.5.8/+esm',
@@ -1023,6 +1032,13 @@
     'https://staticimgly.com/@imgly/background-removal-data/1.7.0/dist/',
     'https://cdn.jsdelivr.net/npm/@imgly/background-removal-data@1.7.0/dist/'
   ];
+
+  function revokeImglyCutoutUrl() {
+    if (imglyCutoutUrl) {
+      try { URL.revokeObjectURL(imglyCutoutUrl); } catch (_) {}
+      imglyCutoutUrl = null;
+    }
+  }
 
   async function loadImglySDK() {
     if (imglySDKCache) return imglySDKCache;
@@ -1055,7 +1071,7 @@
   async function probeImglyCDN(path) {
     const manifestCandidates = ['resources.json', 'manifest.json'];
     const ctrl = new AbortController();
-    const timeout = setTimeout(() => ctrl.abort(), 6000);
+    const timeout = setTimeout(() => ctrl.abort(), 5000);
     try {
       for (const manifest of manifestCandidates) {
         try {
@@ -1100,6 +1116,47 @@
     return true;
   }
 
+  function buildDownscaledFrameBlob() {
+    const w = srcCanvas.width, h = srcCanvas.height;
+    if (!w || !h) return Promise.resolve(null);
+    const maxSide = Math.max(w, h);
+    const scale = maxSide > IMGLY_MAX_INFER_DIM ? (IMGLY_MAX_INFER_DIM / maxSide) : 1;
+    const iw = Math.max(1, Math.round(w * scale));
+    const ih = Math.max(1, Math.round(h * scale));
+    imglyInferCanvas.width = iw;
+    imglyInferCanvas.height = ih;
+    imglyInferCtx.clearRect(0, 0, iw, ih);
+    imglyInferCtx.drawImage(srcCanvas, 0, 0, iw, ih);
+    return new Promise((res) => imglyInferCanvas.toBlob(res, 'image/jpeg', 0.82));
+  }
+
+  async function decodeCutoutBlob(cutoutBlob) {
+    if (typeof createImageBitmap === 'function') {
+      try {
+        const bmp = await createImageBitmap(cutoutBlob);
+        return { drawable: bmp, isBitmap: true };
+      } catch (_) {}
+    }
+    revokeImglyCutoutUrl();
+    const url = URL.createObjectURL(cutoutBlob);
+    imglyCutoutUrl = url;
+    const im = new Image();
+    await new Promise((res, rej) => {
+      im.onload = res;
+      im.onerror = () => rej(new Error('cutout decode failed'));
+      im.src = url;
+    });
+    return { drawable: im, isBitmap: false };
+  }
+
+  function replaceCutoutDrawable(nextEntry) {
+    const prev = state.imglyCutout;
+    state.imglyCutout = nextEntry;
+    if (prev && prev.isBitmap && typeof prev.drawable.close === 'function') {
+      try { prev.drawable.close(); } catch (_) {}
+    }
+  }
+
   /* ── IMAGE path ── */
   async function runImglyOnImage() {
     if (state.sourceType !== 'image' || !state.imageFile) return;
@@ -1127,15 +1184,9 @@
         if (!blob || !(blob instanceof Blob)) throw new Error('removeBackground returned no blob');
 
         setModelStatus('imgly', 'loading', 96, 'Decoding cutout…');
-        const url = URL.createObjectURL(blob);
-        const im = new Image();
-        await new Promise((res, rej) => {
-          im.onload = res;
-          im.onerror = () => rej(new Error('cutout decode failed'));
-          im.src = url;
-        });
+        const decoded = await decodeCutoutBlob(blob);
+        replaceCutoutDrawable(decoded);
 
-        state.imglyCutout = im;
         setModelStatus('imgly', 'ready', 100, 'Ready');
         renderImgly();
         toast('<i class="fa-solid fa-check"></i> @imgly cutout ready', 'success');
@@ -1155,66 +1206,71 @@
     return imglyLoading;
   }
 
-  /* ── VIDEO path — process current frame, throttled ── */
-  function processImglyFrame() {
-    if (imglyFrameBusy) return;
+  /* ── VIDEO path — non-blocking background worker with latest-frame queue ── */
+  function scheduleImglyVideoFrame(forceNow) {
     if (state.sourceType !== 'video') return;
     if (!srcCanvas.width || !srcCanvas.height) return;
 
     const isPlaying = !videoEl.paused && !videoEl.ended;
     const now = performance.now();
-    const threshold = isPlaying ? IMGLY_VIDEO_THROTTLE_MS : 250;
+    const threshold = forceNow ? 0 : (isPlaying ? IMGLY_VIDEO_THROTTLE_MS : 250);
     if (now - imglyLastFrameTime < threshold) return;
 
     imglyLastFrameTime = now;
+
+    buildDownscaledFrameBlob().then((frameBlob) => {
+      if (!frameBlob) return;
+      if (state.engine !== 'imgly' || state.sourceType !== 'video') return;
+      imglyLatestFrameBlob = frameBlob;
+      drainImglyQueue();
+    }).catch(() => {});
+  }
+
+  function drainImglyQueue() {
+    if (imglyFrameBusy || imglyWorkQueue) return;
+    if (!imglyLatestFrameBlob) return;
+
+    const blobToProcess = imglyLatestFrameBlob;
+    imglyLatestFrameBlob = null;
     imglyFrameBusy = true;
 
-    (async () => {
+    imglyWorkQueue = (async () => {
       try {
         await ensureImglyReady();
-
-        const frameBlob = await new Promise((res) => srcCanvas.toBlob(res, 'image/png'));
-        if (!frameBlob) return;
         if (state.engine !== 'imgly' || state.sourceType !== 'video') return;
 
-        setModelStatus('imgly', 'loading', 40, 'Processing frame…');
-
-        const cutoutBlob = await imglySDKCache.removeBackground(frameBlob, {
+        const cutoutBlob = await imglySDKCache.removeBackground(blobToProcess, {
           publicPath: imglyWorkingPath,
           debug: false,
-          output: { format: 'image/png', quality: 0.9 }
+          output: { format: 'image/png', quality: 0.85 }
         });
 
         if (!cutoutBlob || !(cutoutBlob instanceof Blob)) return;
         if (state.engine !== 'imgly' || state.sourceType !== 'video') return;
 
-        const url = URL.createObjectURL(cutoutBlob);
-        const im = new Image();
-        await new Promise((res, rej) => {
-          im.onload = res;
-          im.onerror = () => rej(new Error('cutout decode failed'));
-          im.src = url;
-        });
-
-        state.imglyCutout = im;
-        setModelStatus('imgly', 'ready', 100, 'Ready (video ~1 fps)');
-        renderImgly();
-        URL.revokeObjectURL(url);
-
+        const decoded = await decodeCutoutBlob(cutoutBlob);
+        replaceCutoutDrawable(decoded);
+        setModelStatus('imgly', 'ready', 100, 'Ready (smooth async)');
+        markDirty();
       } catch (e) {
         console.error('[imgly video]', e);
         setModelStatus('imgly', 'error', 0, e.message || 'Frame failed');
       } finally {
         imglyFrameBusy = false;
+        imglyWorkQueue = null;
+        if (imglyLatestFrameBlob && state.engine === 'imgly' && state.sourceType === 'video') {
+          setTimeout(() => drainImglyQueue(), 40);
+        }
       }
     })();
   }
 
   function renderImgly() {
-    const im = state.imglyCutout;
-    if (!im) return;
-    const iw = im.naturalWidth || im.width;
-    const ih = im.naturalHeight || im.height;
+    const entry = state.imglyCutout;
+    if (!entry || !entry.drawable) return;
+    const im = entry.drawable;
+    const iw = im.naturalWidth || im.videoWidth || im.width;
+    const ih = im.naturalHeight || im.videoHeight || im.height;
     if (!iw || !ih) return;
 
     const scale = Math.min(1, state.procWidth / iw);
@@ -1225,7 +1281,9 @@
     maskCanvas.width = cw; maskCanvas.height = ch;
 
     sctx.clearRect(0, 0, cw, ch);
+    sctx.filter = state.edgeBlur > 0 ? 'blur(' + Math.min(2, state.edgeBlur * 0.35) + 'px)' : 'none';
     sctx.drawImage(im, 0, 0, cw, ch);
+    sctx.filter = 'none';
 
     fillMask(1);
     composite();
@@ -1358,13 +1416,13 @@
     videoEl.removeAttribute('src');
     videoEl.load();
     imgEl.removeAttribute('src');
-    audioEl.pause();
-    audioEl.removeAttribute('src');
-    audioEl.load();
-    state.imglyCutout = null;
+    replaceCutoutDrawable(null);
+    revokeImglyCutoutUrl();
     state.modnetHasMask = false;
     imglyFrameBusy = false;
     imglyLastFrameTime = 0;
+    imglyLatestFrameBlob = null;
+    imglyWorkQueue = null;
   }
 
   function detectType(file) {
@@ -1377,6 +1435,8 @@
   }
 
   function tryPlay(el) {
+    el.muted = false;
+    el.volume = 1.0;
     const p = el.play();
     if (p && typeof p.catch === 'function') {
       p.catch(() => {
@@ -1400,6 +1460,36 @@
       return;
     }
 
+    if (type === 'audio') {
+      try { audioEl.pause(); } catch (_) {}
+      audioEl.removeAttribute('src');
+      audioEl.load();
+
+      const url = URL.createObjectURL(file);
+      audioEl.src = url;
+      audioEl.load();
+
+      audioEl.onloadedmetadata = () => {
+        $('audioInfo').innerHTML = '<i class="fa-solid fa-check text-success"></i> Soundtrack: <b>' +
+          escapeHtml(file.name) + '</b> (' + fmtTime(audioEl.duration) + ')';
+        $('audioPlayBtn').disabled = false;
+        $('audioSeek').disabled = false;
+        $('includeAudio').checked = true;
+        toast('<i class="fa-solid fa-music"></i> Audio loaded — it will be muxed into the video export.', 'success');
+      };
+
+      if (!state.hasSource) {
+        $('fileName').textContent = file.name;
+        showEmpty(true);
+        $('emptyState').innerHTML =
+          '<i class="fa-solid fa-music text-4xl opacity-40"></i>' +
+          '<p class="font-bold">Audio file loaded</p>' +
+          '<p class="text-[11px] opacity-70 max-w-xs">Use it as the soundtrack for your exported video. ' +
+          'Load a video too — the audio will be mixed into the WebM export.</p>';
+      }
+      return;
+    }
+
     resetMedia();
     state.hasSource = false;
     state.sourceType = type;
@@ -1416,6 +1506,8 @@
       const url = URL.createObjectURL(file);
       videoEl.src = url;
       videoEl.loop = true;
+      videoEl.muted = false;
+      videoEl.volume = 1.0;
       videoEl.load();
 
       videoEl.onloadedmetadata = () => {
@@ -1451,28 +1543,6 @@
       imgEl.onerror = () => toast('<i class="fa-solid fa-triangle-exclamation"></i> Could not decode this image.', 'error');
       imgEl.src = url;
       $('playBtn').innerHTML = '<i class="fa-solid fa-play"></i>';
-
-    } else if (type === 'audio') {
-      state.hasSource = false;
-      const url = URL.createObjectURL(file);
-      audioEl.src = url;
-      audioEl.load();
-
-      audioEl.onloadedmetadata = () => {
-        $('audioInfo').innerHTML = '<i class="fa-solid fa-check text-success"></i> Soundtrack: <b>' +
-          file.name + '</b> (' + fmtTime(audioEl.duration) + ')';
-        $('audioPlayBtn').disabled = false;
-        $('audioSeek').disabled = false;
-        $('includeAudio').checked = true;
-        toast('<i class="fa-solid fa-music"></i> Audio loaded — it will be muxed into the video export.', 'success');
-      };
-
-      showEmpty(true);
-      $('emptyState').innerHTML =
-        '<i class="fa-solid fa-music text-4xl opacity-40"></i>' +
-        '<p class="font-bold">Audio file loaded</p>' +
-        '<p class="text-[11px] opacity-70 max-w-xs">Use it as the soundtrack for your exported video. ' +
-        'Load a video too — the audio will be mixed into the WebM export.</p>';
     }
   }
 
@@ -1579,7 +1649,7 @@
 
     if (!drawSource()) return;
 
-    /* ── @imgly: images AND video ── */
+    /* ── @imgly: images AND video (non-blocking async queue) ── */
     if (state.engine === 'imgly') {
       if (state.sourceType === 'image') {
         if (state.imglyCutout) {
@@ -1589,14 +1659,14 @@
         }
         return;
       }
-      /* video */
+      /* video: draw current frame immediately at full frame rate so UI never stutters */
       if (state.imglyCutout) {
-        renderImgly();               // show latest cutout
+        renderImgly();
       } else {
-        fillMask(1);                 // show raw frame until first cutout lands
+        fillMask(1);
         composite();
       }
-      processImglyFrame();           // kick off throttled processing
+      scheduleImglyVideoFrame(false);
       return;
     }
 
@@ -1662,6 +1732,7 @@
   $('playBtn').addEventListener('click', () => {
     if (state.sourceType === 'video') {
       if (videoEl.paused) {
+        videoEl.muted = false;
         tryPlay(videoEl);
         $('playBtn').innerHTML = '<i class="fa-solid fa-pause"></i>';
       } else {
@@ -1678,6 +1749,7 @@
   $('restartBtn').addEventListener('click', () => {
     if (state.sourceType === 'video') {
       videoEl.currentTime = 0;
+      videoEl.muted = false;
       tryPlay(videoEl);
       $('playBtn').innerHTML = '<i class="fa-solid fa-pause"></i>';
     }
@@ -1726,16 +1798,17 @@
       try { await ensureModnet(); }
       catch (err) { toast('<i class="fa-solid fa-triangle-exclamation"></i> ' + err.message, 'error'); }
     } else if (state.engine === 'imgly') {
-      /* ★ FIX: imgly now works on BOTH images and video */
       if (state.sourceType === 'image') {
         if (!state.imglyCutout) await runImglyOnImage();
         else renderImgly();
       } else if (state.sourceType === 'video') {
         imglyFrameBusy = false;
         imglyLastFrameTime = 0;
+        imglyLatestFrameBlob = null;
         markDirty();
-        processFrame();
-        toast('<i class="fa-solid fa-circle-info"></i> @imgly on video runs at ~1 fps. MediaPipe is faster for real-time.', 'info');
+        await processFrame();
+        scheduleImglyVideoFrame(true);
+        toast('<i class="fa-solid fa-circle-info"></i> @imgly runs asynchronously in the background without blocking playback.', 'info');
       }
     }
   });
@@ -1823,24 +1896,25 @@
   });
 
   /* ════════════════════════════════════════════════════════════
-     12. AUDIO GRAPH
+     12. AUDIO GRAPH & STREAM CAPTURE (AUDIBLE EXPORT ENGINE)
      ════════════════════════════════════════════════════════════ */
   let audioCtx = null;
   const mediaSourceMap = new WeakMap();
   const activeConnections = [];
 
-  function ensureAudioCtx() {
+  async function ensureAudioCtx() {
     if (!audioCtx) {
       const AC = window.AudioContext || window.webkitAudioContext;
       if (!AC) return null;
       audioCtx = new AC();
     }
-    if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+    if (audioCtx.state === 'suspended') {
+      try { await audioCtx.resume(); } catch (_) {}
+    }
     return audioCtx;
   }
 
-  function getMediaSource(el) {
-    const ctx = ensureAudioCtx();
+  function getMediaSource(el, ctx) {
     if (!ctx) return null;
     let node = mediaSourceMap.get(el);
     if (!node) {
@@ -1868,6 +1942,7 @@
   $('audioPlayBtn').addEventListener('click', () => {
     if (!audioEl.src) return;
     if (audioEl.paused) {
+      audioEl.muted = false;
       tryPlay(audioEl);
       $('audioPlayBtn').innerHTML = '<i class="fa-solid fa-pause"></i>';
     } else {
@@ -1880,18 +1955,42 @@
     $('audioSeek').value = Math.round((audioEl.currentTime / audioEl.duration) * 1000);
     $('audioTime').textContent = fmtTime(audioEl.currentTime);
   });
+  audioEl.addEventListener('ended', () => {
+    $('audioPlayBtn').innerHTML = '<i class="fa-solid fa-play"></i>';
+  });
   $('audioSeek').addEventListener('input', (e) => {
     if (audioEl.duration) audioEl.currentTime = (e.target.value / 1000) * audioEl.duration;
   });
 
   /* ════════════════════════════════════════════════════════════
-     13. EXPORT
+     13. EXPORT (VIDEO + AUDIBLE AUDIO MUX)
      ════════════════════════════════════════════════════════════ */
-  function pickMime(preferred) {
+  function pickMime(preferred, withAudio) {
     if (!window.MediaRecorder) return '';
     const candidates = [];
-    if (preferred && preferred !== 'auto') candidates.push(preferred);
-    candidates.push('video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm', 'video/mp4');
+    if (preferred && preferred !== 'auto') {
+      if (withAudio && preferred.indexOf('webm') !== -1 && preferred.indexOf('opus') === -1) {
+        candidates.push(preferred + ',opus');
+      }
+      candidates.push(preferred);
+    }
+    if (withAudio) {
+      candidates.push(
+        'video/webm;codecs=vp9,opus',
+        'video/webm;codecs=vp8,opus',
+        'video/webm;codecs=h264,opus',
+        'video/webm',
+        'video/mp4;codecs=avc1,mp4a.40.2',
+        'video/mp4'
+      );
+    } else {
+      candidates.push(
+        'video/webm;codecs=vp9',
+        'video/webm;codecs=vp8',
+        'video/webm',
+        'video/mp4'
+      );
+    }
     for (let i = 0; i < candidates.length; i++) {
       try { if (MediaRecorder.isTypeSupported(candidates[i])) return candidates[i]; }
       catch (_) {}
@@ -1933,7 +2032,8 @@
     }
     if (state.exporting) return;
 
-    const mime = pickMime($('exportFormat').value);
+    const wantAudio = $('includeAudio').checked;
+    const mime = pickMime($('exportFormat').value, wantAudio);
     if (!mime) {
       toast('<i class="fa-solid fa-triangle-exclamation"></i> MediaRecorder is not supported in this browser.', 'error');
       return;
@@ -1946,50 +2046,105 @@
     const fps = state.exportFps;
 
     try {
+      const ctx = wantAudio ? await ensureAudioCtx() : null;
+
       videoEl.pause();
       videoEl.loop = false;
+      videoEl.muted = false;
+      videoEl.volume = 1.0;
       videoEl.currentTime = 0;
 
-      const playPromise = videoEl.play();
-      if (playPromise && playPromise.catch) {
-        playPromise.catch(() => {
-          videoEl.muted = true;
-          videoEl.play().catch(() => {});
-        });
+      if (wantAudio && audioEl.src) {
+        audioEl.pause();
+        audioEl.muted = false;
+        audioEl.volume = 1.0;
+        audioEl.currentTime = 0;
       }
-      await new Promise((res) => setTimeout(res, 60));
 
       const stream = outCanvas.captureStream(fps);
+      let audioAttached = false;
 
-      if ($('includeAudio').checked) {
-        const ctx = ensureAudioCtx();
+      if (wantAudio) {
         if (ctx) {
           const audioDest = ctx.createMediaStreamDestination();
+          const mixerGain = ctx.createGain();
+          mixerGain.gain.value = 1.0;
+          connectAudio(mixerGain, audioDest);
+
           try {
-            const vs = getMediaSource(videoEl);
-            if (vs) connectAudio(vs, audioDest);
-          } catch (e) { console.warn('video audio attach failed', e); }
+            const vs = getMediaSource(videoEl, ctx);
+            if (vs) {
+              connectAudio(vs, mixerGain);
+              audioAttached = true;
+            }
+          } catch (e) { console.warn('WebAudio video attach failed', e); }
 
           if (audioEl.src) {
             try {
-              audioEl.currentTime = 0;
-              tryPlay(audioEl);
-              const as = getMediaSource(audioEl);
-              if (as) connectAudio(as, audioDest);
-            } catch (e) { console.warn('soundtrack attach failed', e); }
+              const as = getMediaSource(audioEl, ctx);
+              if (as) {
+                connectAudio(as, mixerGain);
+                audioAttached = true;
+              }
+            } catch (e) { console.warn('WebAudio soundtrack attach failed', e); }
           }
 
-          audioDest.stream.getAudioTracks().forEach((t) => stream.addTrack(t));
+          const destTracks = audioDest.stream.getAudioTracks();
+          if (destTracks.length > 0 && audioAttached) {
+            destTracks.forEach((t) => {
+              t.enabled = true;
+              stream.addTrack(t);
+            });
+          }
+        }
+
+        if (!audioAttached) {
+          try {
+            const rawVidStream = videoEl.captureStream ? videoEl.captureStream() : (videoEl.mozCaptureStream ? videoEl.mozCaptureStream() : null);
+            if (rawVidStream) {
+              rawVidStream.getAudioTracks().forEach((t) => {
+                t.enabled = true;
+                stream.addTrack(t);
+                audioAttached = true;
+              });
+            }
+          } catch (e) { console.warn('Native video captureStream audio fallback failed', e); }
+
+          if (audioEl.src) {
+            try {
+              const rawAudStream = audioEl.captureStream ? audioEl.captureStream() : (audioEl.mozCaptureStream ? audioEl.mozCaptureStream() : null);
+              if (rawAudStream) {
+                rawAudStream.getAudioTracks().forEach((t) => {
+                  t.enabled = true;
+                  stream.addTrack(t);
+                  audioAttached = true;
+                });
+              }
+            } catch (e) { console.warn('Native audio captureStream fallback failed', e); }
+          }
         }
       }
 
-      const rec = new MediaRecorder(stream, { mimeType: mime, videoBitsPerSecond: bitrate });
+      await videoEl.play();
+      if (wantAudio && audioEl.src) {
+        try { await audioEl.play(); } catch (e) { console.warn('Audio play failed', e); }
+      }
+
+      markDirty();
+      await processFrame();
+
+      const recOptions = {
+        mimeType: mime,
+        videoBitsPerSecond: bitrate,
+        audioBitsPerSecond: 128000
+      };
+      const rec = new MediaRecorder(stream, recOptions);
       state.recorder = rec;
       const chunks = [];
       const startedAt = performance.now();
       const durationMs = (videoEl.duration || 0) * 1000;
 
-      rec.ondataavailable = (e) => { if (e.data && e.data.size) chunks.push(e.data); };
+      rec.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
 
       rec.onstop = () => {
         const ext = mime.indexOf('mp4') !== -1 ? '.mp4' : '.webm';
@@ -1998,12 +2153,23 @@
         downloadBlob(blob, 'hexgreenbg-' + Date.now() + ext);
 
         disconnectAllAudio();
-        if (audioEl.src) { audioEl.pause(); audioEl.currentTime = 0; }
+        if (audioEl.src) {
+          audioEl.pause();
+          audioEl.currentTime = 0;
+          $('audioPlayBtn').innerHTML = '<i class="fa-solid fa-play"></i>';
+        }
 
         videoEl.loop = true;
+        $('playBtn').innerHTML = '<i class="fa-solid fa-play"></i>';
         setExportUI(false);
         state.recorder = null;
-        toast('<i class="fa-solid fa-check"></i> Export complete — ' + (blob.size / 1048576).toFixed(2) + ' MB', 'success');
+        const hasAudioTrack = stream.getAudioTracks().length > 0;
+        toast(
+          '<i class="fa-solid fa-check"></i> Export complete' +
+          (hasAudioTrack ? ' (Video + Audio)' : '') +
+          ' — ' + (blob.size / 1048576).toFixed(2) + ' MB',
+          'success'
+        );
       };
 
       rec.onerror = (e) => {
@@ -2041,6 +2207,7 @@
     } catch (err) {
       console.error(err);
       disconnectAllAudio();
+      videoEl.loop = true;
       setExportUI(false);
       toast('<i class="fa-solid fa-triangle-exclamation"></i> Export failed: ' + err.message, 'error');
     }
@@ -2048,14 +2215,6 @@
 
   $('exportBtn').addEventListener('click', () => {
     if (state.exporting) return;
-    if (state.sourceType === 'video') {
-      try {
-        videoEl.pause();
-        videoEl.currentTime = 0;
-        const p = videoEl.play();
-        if (p && p.catch) p.catch(() => { videoEl.muted = true; videoEl.play().catch(() => {}); });
-      } catch (_) {}
-    }
     exportVideo();
   });
 
